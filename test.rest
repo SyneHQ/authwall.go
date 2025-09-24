@@ -1,0 +1,35 @@
+### Health Check
+GET http://localhost:1012/health
+
+### Test /auth endpoint with missing token
+GET http://localhost:1012/auth
+
+### Test /auth endpoint with token via Authorization header
+GET http://localhost:1012/auth
+Authorization: Bearer xxxxxx
+
+### Test /auth endpoint with token via query parameter
+GET http://localhost:1012/auth?token=your-jwt-token-here
+
+### Test /decrypt endpoint with GET request
+GET http://localhost:1012/decrypt?token=your-jwt-token-here&secret=your-secret-here&salt=authjs.session-token
+
+### Test /decrypt endpoint with POST request
+POST http://localhost:3000/decrypt
+Content-Type: application/json
+
+{
+  "token": "xxx",
+  "secret": "xxx", 
+  "salt": "__Secure-xxx"
+}
+
+### Test /decrypt endpoint with missing parameters
+POST http://localhost:1012/decrypt
+Content-Type: application/json
+
+{
+  "token": "",
+  "secret": "",
+  "salt": ""
+}
