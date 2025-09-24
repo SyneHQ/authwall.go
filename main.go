@@ -266,7 +266,7 @@ func main() {
 
 	addr := os.Getenv("ADDR")
 	if addr == "" {
-		addr = ":1012"
+		addr = ":80"
 	}
 
 	mux := http.NewServeMux()
@@ -274,7 +274,13 @@ func main() {
 	// Traefik ForwardAuth endpoint: 2xx allows, otherwise deny.
 	mux.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
 
-		// if a OPTIONS request, return 200
+		// if a OPTIONS request, return 200 or acme challenge
+		if r.URL.Query().Get("token") == "acme-challenge" {
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte("acme-challenge"))
+			return
+		}
+
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusOK)
 			return
