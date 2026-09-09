@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/http"
 	"os"
 	"strings"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/lestrrat-go/jwx/v2/jwa"
 	"github.com/lestrrat-go/jwx/v2/jwe"
+	serviceSecrets "github.com/synehq/authwall.go/internal/secrets"
 	"golang.org/x/crypto/hkdf"
 )
 
@@ -102,6 +104,9 @@ type authResult struct {
 }
 
 func decryptAuthJWE(_ context.Context, token string, secrets []string, salt string) (*authResult, error) {
+	if len(token) > 64*1024 {
+		return nil, fmt.Errorf("token too large")
+	}
 	// Parse headers to learn alg/enc/kid without attempting decryption first.
 	msg, err := jwe.ParseString(token)
 	if err != nil {
@@ -165,23 +170,22 @@ func decryptAuthJWE(_ context.Context, token string, secrets []string, salt stri
 		return nil, fmt.Errorf("invalid payload: %w", err)
 	}
 
-	// Optional exp check if present.
-	if v, ok := payload["exp"]; ok {
-		switch exp := v.(type) {
-		case float64:
-			if time.Now().Unix() > int64(exp) {
-				return nil, fmt.Errorf("token expired")
-			}
-		case json.Number:
-			if n, _ := exp.Int64(); time.Now().Unix() > n {
-				return nil, fmt.Errorf("token expired")
+	now := time.Now().Unix()
+	exp, ok := payload["exp"].(float64)
+	if !ok || math.IsNaN(exp) || math.IsInf(exp, 0) || exp <= float64(now) || exp != math.Trunc(exp) {
+		return nil, fmt.Errorf("missing or invalid expiration")
+	}
+	for _, claim := range []string{"nbf", "iat"} {
+		if raw, exists := payload[claim]; exists {
+			value, ok := raw.(float64)
+			if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value > float64(now+60) {
+				return nil, fmt.Errorf("invalid token time")
 			}
 		}
 	}
-
-	sub := ""
-	if v, ok := payload["sub"].(string); ok {
-		sub = v
+	sub, ok := payload["sub"].(string)
+	if !ok || strings.TrimSpace(sub) == "" {
+		return nil, fmt.Errorf("missing subject")
 	}
 
 	_ = usedKey // kept for symmetry/debug; not returned
@@ -234,6 +238,9 @@ func getTokenFromRequest(r *http.Request, cookieName string, headerName string, 
 }
 
 func main() {
+	if err := serviceSecrets.Load(); err != nil {
+		log.Fatal(err)
+	}
 	startCleanup()
 
 	// Configuration via env
@@ -272,19 +279,67 @@ func main() {
 	mux := http.NewServeMux()
 
 	// Traefik ForwardAuth endpoint: 2xx allows, otherwise deny.
-	mux.HandleFunc("/auth", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/auth", authHandler(secrets, salt, cookieName, headerName, queryName))
 
-		// if a OPTIONS request, return 200 or acme challenge
-		if r.URL.Query().Get("token") == "acme-challenge" {
-			w.WriteHeader(http.StatusOK)
-			w.Write([]byte("acme-challenge"))
-			return
-		}
+	// Optional local debugging helper. Never expose secret-bearing query URLs.
+	if os.Getenv("AUTHWALL_ENABLE_DEBUG_ENDPOINTS") == "true" {
+		mux.HandleFunc("/decrypt", func(w http.ResponseWriter, r *http.Request) {
+			type Req struct {
+				Token  string `json:"token"`
+				Secret string `json:"secret"`
+				Salt   string `json:"salt"`
+			}
+			type Resp struct {
+				Success bool           `json:"success"`
+				Payload map[string]any `json:"payload,omitempty"`
+				Error   string         `json:"error,omitempty"`
+			}
 
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusOK)
-			return
+			if r.Method != http.MethodPost {
+				http.Error(w, "method not allowed", 405)
+				return
+			}
+			r.Body = http.MaxBytesReader(w, r.Body, 128*1024)
+			var req Req
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				http.Error(w, "bad json", 400)
+				return
+			}
+			token, secret, lSalt := req.Token, req.Secret, req.Salt
+
+			if token == "" || secret == "" || lSalt == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				json.NewEncoder(w).Encode(Resp{Error: "missing token/secret/salt"})
+				return
+			}
+			res, err := decryptAuthJWE(r.Context(), token, []string{secret}, lSalt)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(Resp{Error: err.Error()})
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(Resp{Success: true, Payload: res.Payload})
+
+		})
+
+	}
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		type H struct {
+			Status    string `json:"status"`
+			Timestamp string `json:"timestamp"`
 		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(H{Status: "ok", Timestamp: time.Now().UTC().Format(time.RFC3339)})
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 32 * 1024}
+	log.Printf("auth service listening on %s", addr)
+	log.Fatal(srv.ListenAndServe())
+}
+
+func authHandler(secrets []string, salt, cookieName, headerName, queryName string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
 
 		start := time.Now()
 		ctx := r.Context()
@@ -316,61 +371,5 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 
 		log.Printf("%s %s %s - %v", r.Method, r.URL.Path, r.RemoteAddr, time.Since(start))
-	})
-
-	// Testing endpoints mirroring the provided Bun server.
-	mux.HandleFunc("/decrypt", func(w http.ResponseWriter, r *http.Request) {
-		type Req struct {
-			Token  string `json:"token"`
-			Secret string `json:"secret"`
-			Salt   string `json:"salt"`
-		}
-		type Resp struct {
-			Success bool           `json:"success"`
-			Payload map[string]any `json:"payload,omitempty"`
-			Error   string         `json:"error,omitempty"`
-		}
-
-		var token, secret, lSalt string
-		if r.Method == http.MethodPost {
-			var req Req
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				http.Error(w, "bad json", http.StatusBadRequest)
-				return
-			}
-			token, secret, lSalt = req.Token, req.Secret, req.Salt
-		} else {
-			q := r.URL.Query()
-			token = q.Get("token")
-			secret = q.Get("secret")
-			lSalt = q.Get("salt")
-		}
-		if token == "" || secret == "" || lSalt == "" {
-			w.WriteHeader(http.StatusBadRequest)
-			json.NewEncoder(w).Encode(Resp{Error: "missing token/secret/salt"})
-			return
-		}
-		res, err := decryptAuthJWE(r.Context(), token, []string{secret}, lSalt)
-		if err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			json.NewEncoder(w).Encode(Resp{Error: err.Error()})
-			return
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(Resp{Success: true, Payload: res.Payload})
-
-	})
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		type H struct {
-			Status    string `json:"status"`
-			Timestamp string `json:"timestamp"`
-		}
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(H{Status: "ok", Timestamp: time.Now().UTC().Format(time.RFC3339)})
-	})
-
-	srv := &http.Server{Addr: addr, Handler: mux}
-	log.Printf("auth service listening on %s", addr)
-	log.Fatal(srv.ListenAndServe())
+	}
 }
