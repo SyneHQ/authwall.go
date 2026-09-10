@@ -7,6 +7,7 @@ import (
 	infisical "github.com/infisical/go-sdk"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -19,12 +20,16 @@ func Hydrate(getenv func(string) string, fetch Fetch) error {
 		return nil
 	}
 	cfg := Config{URL: getenv("INFISICAL_API_URL"), ClientID: getenv("INFISICAL_CLIENT_ID"), ClientSecret: getenv("INFISICAL_CLIENT_SECRET"), ProjectID: getenv("INFISICAL_PROJECT_ID"), Environment: getenv("INFISICAL_ENV")}
+	cfg.URL = strings.TrimSpace(cfg.URL)
 	if cfg.URL == "" {
 		cfg.URL = "https://infisical.synehq.com"
 	}
 	parsed, err := url.Parse(cfg.URL)
-	if err != nil || parsed.Scheme != "https" || parsed.Hostname() == "" || parsed.User != nil {
-		return errors.New("Infisical requires an HTTPS service URL")
+	if err != nil || parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return errors.New("invalid Infisical service URL")
+	}
+	if parsed.Scheme != "https" && !(parsed.Scheme == "http" && getenv("INFISICAL_ALLOW_INSECURE_HTTP") == "true") {
+		return errors.New("Infisical requires HTTPS unless INFISICAL_ALLOW_INSECURE_HTTP=true is explicitly set for a trusted private network")
 	}
 	if cfg.ClientID == "" || cfg.ClientSecret == "" || cfg.ProjectID == "" || cfg.Environment == "" {
 		return errors.New("Infisical bootstrap configuration incomplete")
