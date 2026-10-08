@@ -4,7 +4,7 @@ WORKDIR /app
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-w -s' -o authwall main.go
+RUN CGO_ENABLED=0 GOOS=linux go build -a -ldflags '-w -s' -o authwall .
 
 FROM gcr.io/distroless/cc-debian12 AS runner
 

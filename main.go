@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	defaultCookieName = "authjs.session_token"
+	defaultCookieName = "authjs.session-token"
 	cacheTTL          = 12 * time.Hour
 	cleanupInterval   = 1 * time.Hour
 )
@@ -214,9 +214,9 @@ func startCleanup() {
 }
 
 func getTokenFromRequest(r *http.Request, cookieName string, headerName string, queryName string) string {
-	// 1) Cookie
-	if c, err := r.Cookie(cookieName); err == nil && c.Value != "" {
-		return c.Value
+	// 1) Cookie, including Auth.js chunks. Reject ambiguous or incomplete cookies.
+	if token, present := sessionCookie(r, cookieName); present {
+		return token
 	}
 	// 2) Authorization: Bearer
 	if h := r.Header.Get("Authorization"); strings.HasPrefix(strings.ToLower(h), "bearer ") {
@@ -280,6 +280,8 @@ func main() {
 
 	// Traefik ForwardAuth endpoint: 2xx allows, otherwise deny.
 	mux.HandleFunc("/auth", authHandler(secrets, salt, cookieName, headerName, queryName))
+
+	mux.HandleFunc("/verify", verifyHandler(secrets, salt))
 
 	// Optional local debugging helper. Never expose secret-bearing query URLs.
 	if os.Getenv("AUTHWALL_ENABLE_DEBUG_ENDPOINTS") == "true" {
